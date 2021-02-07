@@ -159,7 +159,7 @@ impl Message {
 
     pub(crate) fn key(&self, peer: &Peer) -> Option<kbucket::Key<PeerId>> {
         self.valid_id_bytes()
-            .map(|id| kbucket::Key::new(PeerId::new(peer.addr, id)))
+            .map(|id| kbucket::Key::new(PeerId::new(peer.addr, id, peer.referrer)))
     }
 
     /// Decode the `to` field into `PeerId`

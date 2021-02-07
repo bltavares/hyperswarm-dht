@@ -46,7 +46,7 @@ impl QueryTable {
         self.peers
             .keys()
             .filter(|p| p.preimage().addr == peer.addr)
-            .map(|p| rpc::Peer::from(p.preimage().addr))
+            .map(|p| rpc::Peer::new(p.preimage().addr, p.preimage().referrer))
             .next()
     }
 
@@ -64,7 +64,7 @@ impl QueryTable {
             self.peers
                 .iter()
                 .filter(|(_, s)| s.is_not_contacted())
-                .map(|(p, _)| rpc::Peer::from(p.preimage().addr)),
+                .map(|(p, _)| rpc::Peer::new(p.preimage().addr, p.preimage().referrer)),
             parallelism,
         )
     }
@@ -83,7 +83,7 @@ impl QueryTable {
             peers
                 .into_iter()
                 .take(usize::from(K_VALUE))
-                .map(|p| rpc::Peer::from(p.preimage().addr)),
+                .map(|p| rpc::Peer::new(p.preimage().addr, p.preimage().referrer)),
             parallelism,
         )
     }

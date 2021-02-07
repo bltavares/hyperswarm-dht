@@ -49,6 +49,7 @@ pub struct RpcDht {
     io: IoHandler<QueryId>,
     bootstrap_job: PeriodicJob,
     ping_job: PeriodicJob,
+    await_job: PeriodicJob,
     /// The currently active (i.e. in-progress) queries.
     queries: QueryPool,
     /// Custom commands
@@ -258,11 +259,7 @@ impl RpcDht {
         let socket = if let Some(socket) = config.socket {
             socket
         } else {
-            UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::UNSPECIFIED,
-                0,
-            )))
-            .await?
+            UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))).await?
         };
 
         let io = IoHandler::new(query_id, socket, config.io_config);
@@ -273,6 +270,7 @@ impl RpcDht {
             io,
             bootstrap_job: PeriodicJob::new(config.bootstrap_interval),
             ping_job: PeriodicJob::new(config.ping_interval),
+            await_job: PeriodicJob::new(Duration::from_secs(2)),
             queries: QueryPool::new(local_id, config.query_config),
             commands: config.commands,
             queued_events: Default::default(),
@@ -338,11 +336,14 @@ impl RpcDht {
 
     /// Ping a remote
     pub fn ping(&mut self, peer: &PeerId) {
+        let value = peer.id.clone().to_vec();
+        let peer = Peer::new(peer.addr, peer.referrer);
         self.io.query(
             Command::Ping,
             None,
-            Some(peer.id.clone().to_vec()),
-            Peer::from(peer.addr),
+            Some(value),
+            peer.clone(),
+            Some(peer),
             // TODO refactor ping handling, no query id required
             self.queries.next_query_id(),
         )
@@ -359,6 +360,7 @@ impl RpcDht {
                     Some(PeerId::new(
                         entry.node.value.addr,
                         entry.node.key.preimage().clone(),
+                        None,
                     ))
                 } else {
                     None
@@ -396,7 +398,7 @@ impl RpcDht {
             .kbuckets
             .closest(&target)
             .take(usize::from(K_VALUE))
-            .map(|e| PeerId::new(e.node.value.addr, e.node.key.preimage().clone()))
+            .map(|e| PeerId::new(e.node.value.addr, e.node.key.preimage().clone(), None))
             .map(Key::new)
             .collect::<Vec<_>>();
         self.queries.add_stream(
@@ -405,14 +407,18 @@ impl RpcDht {
             query_type,
             target,
             value,
-            self.bootstrap_nodes.iter().cloned().map(Peer::from),
+            self.bootstrap_nodes
+                .iter()
+                .cloned()
+                .map(|addr| Peer::new(addr, None)),
         )
     }
 
     pub fn holepunch(&mut self, peer: Peer) -> bool {
         if peer.referrer.is_some() {
             let id = self.queries.next_query_id();
-            self.io.query(Command::Holepunch, None, None, peer, id);
+            self.io
+                .query(Command::Holepunch, None, None, peer.clone(), Some(peer), id);
             true
         } else {
             false
@@ -474,7 +480,6 @@ impl RpcDht {
                         log::debug!("Bucket full. Peer not added to routing table: {:?}", peer)
                     }
                     kbucket::InsertResult::Pending { disconnected: _ } => {
-
                         // TODO dial remote
                     }
                 }
@@ -528,14 +533,14 @@ impl RpcDht {
                 Entry::Present(mut entry, _) => {
                     entry.value().next_ping = Instant::now() + self.ping_job.interval;
                     self.queued_events.push_back(RpcDhtEvent::ResponseResult(Ok(
-                        ResponseOk::Pong(Peer::from(entry.value().addr)),
+                        ResponseOk::Pong(Peer::new(entry.value().addr, None)),
                     )));
                     return;
                 }
                 Entry::Pending(mut entry, _) => {
                     entry.value().next_ping = Instant::now() + self.ping_job.interval;
                     self.queued_events.push_back(RpcDhtEvent::ResponseResult(Ok(
-                        ResponseOk::Pong(Peer::from(entry.value().addr)),
+                        ResponseOk::Pong(Peer::new(entry.value().addr, None)),
                     )));
                     return;
                 }
@@ -676,7 +681,7 @@ impl RpcDht {
                 }
             }
             if let Some(from) = value.decode_from_peer() {
-                peer = Peer::from(from)
+                peer = Peer::new(from, Some(peer.addr))
             }
             self.io.response(msg, None, None, peer)
         }
@@ -709,19 +714,17 @@ impl RpcDht {
     /// Handle the event generated from the underlying IO
     fn inject_event(&mut self, event: IoHandlerEvent<QueryId>) {
         match event {
-            IoHandlerEvent::OutResponse { .. } => {}
-            IoHandlerEvent::OutSocketErr { .. } => {}
+            IoHandlerEvent::OutResponse { .. }
+            | IoHandlerEvent::OutSocketErr { .. }
+            | IoHandlerEvent::InMessageErr { .. }
+            | IoHandlerEvent::InSocketErr { .. }
+            | IoHandlerEvent::OutRequest { .. } => {}
             IoHandlerEvent::InRequest { msg, peer, ty } => {
                 self.on_request(msg, peer, ty);
             }
-            IoHandlerEvent::InMessageErr { .. } => {}
-            IoHandlerEvent::InSocketErr { .. } => {}
             IoHandlerEvent::InResponseBadRequestId { peer, .. } => {
                 // received a response that did not match any issued requests
                 self.remove_node(&peer);
-            }
-            IoHandlerEvent::OutRequest { .. } => {
-                // sent a request
             }
             IoHandlerEvent::InResponse {
                 req,
@@ -753,7 +756,13 @@ impl RpcDht {
                 target,
                 value,
             } => {
-                self.io.query(command, Some(target), value, peer, id);
+                // JS find node has to: None
+                let to = if command == Command::FindNode {
+                    None
+                } else {
+                    Some(peer.clone())
+                };
+                self.io.query(command, Some(target), value, peer, to, id);
             }
             QueryEvent::RemoveNode { id } => {
                 self.remove_peer(&Key::new(id));
@@ -790,12 +799,16 @@ impl RpcDht {
                     roundtrip_token,
                     to,
                 } => {
-                    self.add_node(peer.id, Peer::from(peer.addr), Some(roundtrip_token), to);
+                    self.add_node(
+                        peer.id,
+                        Peer::new(peer.addr, peer.referrer),
+                        Some(roundtrip_token),
+                        to,
+                    );
                 }
                 _ => {}
             }
         }
-
         // first `find_node` query is issued as bootstrap
         if is_find_node && !self.bootstrapped {
             self.bootstrapped = true;
@@ -864,6 +877,11 @@ impl Stream for RpcDht {
                                 return Poll::Ready(Some(event));
                             }
                         }
+                        QueryPoolState::Retry(q) => {
+                            if let Some(peer) = q.retry() {
+                                pin.holepunch(peer);
+                            }
+                        }
                         QueryPoolState::Waiting(None) | QueryPoolState::Idle => {
                             break;
                         }
@@ -875,7 +893,9 @@ impl Stream for RpcDht {
             // If no new events have been queued either, signal `Pending` to
             // be polled again later.
             if pin.queued_events.is_empty() {
-                return Poll::Pending;
+                if let Poll::Pending = pin.await_job.poll(cx, now) {
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -890,14 +910,11 @@ pub struct Peer {
 
 impl Into<Holepunch> for &Peer {
     fn into(self) -> Holepunch {
-        Holepunch::with_from(self.encode())
-    }
-}
-
-impl Into<Holepunch> for SocketAddr {
-    fn into(self) -> Holepunch {
-        let peer = Peer::from(self);
-        (&peer).into()
+        if let Some(referrer) = self.referrer {
+            Holepunch::new(self.encode(), referrer.encode())
+        } else {
+            Holepunch::with_from(self.encode())
+        }
     }
 }
 
@@ -905,11 +922,12 @@ impl Into<Holepunch> for SocketAddr {
 pub struct PeerId {
     pub addr: SocketAddr,
     pub id: IdBytes,
+    pub referrer: Option<SocketAddr>,
 }
 
 impl PeerId {
-    fn new(addr: SocketAddr, id: IdBytes) -> Self {
-        Self { addr, id }
+    fn new(addr: SocketAddr, id: IdBytes, referrer: Option<SocketAddr>) -> Self {
+        Self { addr, id, referrer }
     }
 }
 
@@ -997,15 +1015,6 @@ pub struct Node {
 impl Peer {
     pub fn new(addr: SocketAddr, referrer: Option<SocketAddr>) -> Self {
         Self { addr, referrer }
-    }
-}
-
-impl<T: Into<SocketAddr>> From<T> for Peer {
-    fn from(s: T) -> Self {
-        Self {
-            addr: s.into(),
-            referrer: None,
-        }
     }
 }
 

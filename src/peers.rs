@@ -71,6 +71,7 @@ impl TryFrom<&[u8]> for PeerId {
         Ok(PeerId {
             id: IdBytes::try_from(&buf[0..32]).expect("s.a."),
             addr: decode_addr(&buf[32..]).expect("s.a."),
+            referrer: None,
         })
     }
 }

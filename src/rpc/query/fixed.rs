@@ -18,7 +18,7 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use std::{collections::hash_map::Entry, num::NonZeroUsize, vec};
+use std::{collections::hash_map::Entry, collections::VecDeque, num::NonZeroUsize};
 
 use fnv::FnvHashMap;
 
@@ -35,10 +35,13 @@ pub struct FixedPeersIter {
     peers: FnvHashMap<Peer, PeerState>,
 
     /// The backlog of peers that can still be emitted.
-    iter: vec::IntoIter<Peer>,
+    iter: VecDeque<Peer>,
 
     /// The internal state of the iterator.
     state: State,
+
+    /// The last peer so we can retry
+    last_peer: Option<Peer>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -65,13 +68,14 @@ impl FixedPeersIter {
     where
         I: IntoIterator<Item = Peer>,
     {
-        let peers = peers.into_iter().collect::<Vec<_>>();
+        let peers = peers.into_iter().collect::<VecDeque<_>>();
 
         Self {
             parallelism,
-            iter: peers.into_iter(),
+            iter: peers,
             peers: Default::default(),
             state: State::Waiting { num_waiting: 0 },
+            last_peer: None,
         }
     }
 
@@ -136,7 +140,7 @@ impl FixedPeersIter {
                     return PeersIterState::WaitingAtCapacity;
                 }
                 loop {
-                    match self.iter.next() {
+                    match self.iter.pop_front() {
                         None => {
                             if *num_waiting == 0 {
                                 self.state = State::Finished;
@@ -145,18 +149,38 @@ impl FixedPeersIter {
                                 return PeersIterState::Waiting(None);
                             }
                         }
-                        Some(p) => match self.peers.entry(p.clone()) {
-                            Entry::Occupied(_) => {} // skip duplicates
-                            Entry::Vacant(e) => {
-                                *num_waiting += 1;
-                                e.insert(PeerState::Waiting);
-                                return PeersIterState::Waiting(Some(p));
+                        Some(p) => {
+                            *num_waiting += 1;
+                            self.last_peer = Some(p.clone());
+                            match self.peers.entry(p.clone()) {
+                                Entry::Vacant(e) => {
+                                    e.insert(PeerState::Waiting);
+                                }
+                                _ => {}
                             }
-                        },
+                            return PeersIterState::Waiting(Some(p));
+                        }
                     }
                 }
             }
         }
+    }
+
+    pub(crate) fn retry(&mut self) -> Option<Peer> {
+        if let Some(peer) = self.last_peer.take() {
+            self.iter.push_front(peer.clone());
+
+            match &mut self.state {
+                State::Waiting { num_waiting } => {
+                    *num_waiting -= 1;
+                }
+                _ => {}
+            }
+
+            return Some(peer);
+        }
+
+        return None;
     }
 
     pub fn into_result(self) -> impl Iterator<Item = Peer> {

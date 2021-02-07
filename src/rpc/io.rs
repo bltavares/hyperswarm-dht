@@ -213,7 +213,7 @@ where
         msg.set_holepunch(&Holepunch::with_to(peer.encode()));
         self.send_message(MessageEvent::Query {
             msg,
-            peer: Peer::from(referrer),
+            peer: Peer::new(referrer, None),
             user_data,
         })
     }
@@ -252,13 +252,14 @@ where
         target: Option<IdBytes>,
         value: Option<Vec<u8>>,
         peer: Peer,
+        to: Option<Peer>,
         user_data: TUserData,
     ) {
         let msg = Message {
             version: Some(VERSION),
             r#type: Type::Query.id(),
             rid: 0,
-            to: Some(peer.encode()),
+            to: to.map(|to| to.encode()),
             id: self.msg_id(),
             target: target.map(|x| x.to_vec()),
             closer_nodes: None,
@@ -396,7 +397,7 @@ where
                 msg.id = None
             }
         }
-        let peer = Peer::from(rinfo);
+        let peer = Peer::new(rinfo, None);
 
         match msg.get_type() {
             Ok(ty) => match ty {

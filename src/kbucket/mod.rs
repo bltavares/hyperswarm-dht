@@ -105,8 +105,8 @@ pub const K_VALUE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(20) };
 /// waiting for at a particular time while it continues to make progress towards
 /// locating the closest peers to a key.
 ///
-/// The current value is `3`.
-pub const ALPHA_VALUE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(3) };
+/// The current value is `16`.
+pub const ALPHA_VALUE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(16) };
 
 /// Maximum number of k-buckets.
 const NUM_BUCKETS: usize = 256;

@@ -23,6 +23,8 @@ mod fixed;
 mod peers;
 pub mod table;
 
+const MAX_RETRY_ATTEMPTS: u8 = 2;
+
 /// A `QueryPool` provides an aggregate state machine for driving `Query`s to
 /// completion.
 #[derive(Debug)]
@@ -49,7 +51,7 @@ pub struct QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         QueryConfig {
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(4),
             replication_factor: NonZeroUsize::new(K_VALUE.get()).expect("K_VALUE > 0"),
             parallelism: ALPHA_VALUE,
         }
@@ -132,6 +134,7 @@ impl QueryPool {
     /// Polls the pool to advance the queries.
     pub fn poll(&mut self, now: Instant) -> QueryPoolState<'_> {
         let mut finished = None;
+        let mut retry = None;
         let mut timeout = None;
         let mut waiting = None;
 
@@ -150,6 +153,11 @@ impl QueryPool {
                 Poll::Pending => {
                     let elapsed = now - query.stats.start.unwrap_or(now);
                     if elapsed >= self.config.timeout {
+                        if query.retry_attempts <= MAX_RETRY_ATTEMPTS {
+                            query.retry_attempts += 1;
+                            retry = Some(query_id);
+                            break;
+                        }
                         timeout = Some(query_id);
                         break;
                     }
@@ -160,6 +168,12 @@ impl QueryPool {
         if let Some((event, query_id)) = waiting {
             let query = self.queries.get_mut(&query_id).expect("s.a.");
             return QueryPoolState::Waiting(Some((query, event)));
+        }
+
+        if let Some(query_id) = retry {
+            let query = self.queries.get_mut(&query_id).expect("s.a.");
+            query.stats.start = Some(now);
+            return QueryPoolState::Retry(query);
         }
 
         if let Some(query_id) = finished {
@@ -193,6 +207,8 @@ pub enum QueryPoolState<'a> {
     Finished(QueryStream),
     /// A query has timed out.
     Timeout(QueryStream),
+    /// A query has to be retried
+    Retry(&'a mut QueryStream),
 }
 
 #[derive(Debug)]
@@ -212,6 +228,8 @@ pub struct QueryStream {
     ty: QueryType,
     /// The value to include in each message
     value: Option<Vec<u8>>,
+    /// How many times a query has been retried
+    retry_attempts: u8,
     /// The inner query state.
     pub inner: QueryTable,
 }
@@ -242,6 +260,7 @@ impl QueryStream {
             stats: QueryStats::empty(),
             value,
             ty,
+            retry_attempts: 0,
             inner: QueryTable::new(local_id, target, peers),
         }
     }
@@ -286,14 +305,25 @@ impl QueryStream {
                     *state = PeerState::Failed;
                 }
             }
-            return None;
+
+            // Returns response to handle new commands
+            return Some(Response {
+                query: self.id,
+                ty: self.ty,
+                cmd: self.cmd.clone(),
+                to: resp.decode_to_peer(),
+                peer: peer.addr,
+                peer_id: resp.valid_id_bytes(),
+                value: resp.value,
+            });
         }
 
         self.stats.success += 1;
         self.peer_iter.on_success(&peer);
 
         if let QueryPeerIter::Bootstrap(_) = self.peer_iter {
-            for node in resp.decode_closer_nodes() {
+            for mut node in resp.decode_closer_nodes() {
+                node.referrer = Some(peer.addr);
                 self.inner.add_unverified(node);
             }
             if !self.ty.is_query() {
@@ -441,6 +471,10 @@ impl QueryStream {
             cmd: self.cmd,
         }
     }
+
+    pub(crate) fn retry(&mut self) -> Option<Peer> {
+        self.peer_iter.retry()
+    }
 }
 
 /// The peer selection strategies that can be used by queries.
@@ -465,6 +499,14 @@ impl QueryPeerIter {
             QueryPeerIter::Bootstrap(iter) => iter.on_failure(peer),
             QueryPeerIter::MovingCloser(iter) => iter.on_failure(peer),
             QueryPeerIter::Updating(iter) => iter.on_failure(peer),
+        }
+    }
+
+    fn retry(&mut self) -> Option<Peer> {
+        match self {
+            QueryPeerIter::Bootstrap(iter) => iter.retry(),
+            QueryPeerIter::MovingCloser(iter) => iter.retry(),
+            QueryPeerIter::Updating(iter) => iter.retry(),
         }
     }
 }
