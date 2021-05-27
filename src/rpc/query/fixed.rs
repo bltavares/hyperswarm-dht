@@ -21,7 +21,9 @@
 use std::{collections::hash_map::Entry, collections::VecDeque, num::NonZeroUsize};
 
 use fnv::FnvHashMap;
+use wasm_timer::Instant;
 
+use crate::kbucket::PEER_REQUEST_TIMEOUT;
 use crate::rpc::query::peers::PeersIterState;
 use crate::rpc::Peer;
 
@@ -41,7 +43,9 @@ pub struct FixedPeersIter {
     state: State,
 
     /// The last peer so we can retry
-    last_peer: Option<Peer>,
+    pub(crate) last_peer: Option<Peer>,
+
+    start: Instant,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -53,7 +57,7 @@ enum State {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum PeerState {
     /// The iterator is waiting for a result to be reported back for the peer.
-    Waiting,
+    Waiting { retries: u8 },
 
     /// The iterator has been informed that the attempt to contact the peer
     /// failed.
@@ -76,6 +80,7 @@ impl FixedPeersIter {
             peers: Default::default(),
             state: State::Waiting { num_waiting: 0 },
             last_peer: None,
+            start: Instant::now(),
         }
     }
 
@@ -91,7 +96,7 @@ impl FixedPeersIter {
     /// calling this function has no effect and `false` is returned.
     pub fn on_success(&mut self, peer: &Peer) -> bool {
         if let State::Waiting { num_waiting } = &mut self.state {
-            if let Some(state @ PeerState::Waiting) = self.peers.get_mut(peer) {
+            if let Some(state @ PeerState::Waiting { .. }) = self.peers.get_mut(peer) {
                 *state = PeerState::Succeeded;
                 *num_waiting -= 1;
                 return true;
@@ -112,7 +117,7 @@ impl FixedPeersIter {
     /// calling this function has no effect and `false` is returned.
     pub fn on_failure(&mut self, peer: &Peer) -> bool {
         if let State::Waiting { num_waiting } = &mut self.state {
-            if let Some(state @ PeerState::Waiting) = self.peers.get_mut(peer) {
+            if let Some(state @ PeerState::Waiting { .. }) = self.peers.get_mut(peer) {
                 *state = PeerState::Failed;
                 *num_waiting -= 1;
                 return true;
@@ -142,7 +147,7 @@ impl FixedPeersIter {
                 loop {
                     match self.iter.pop_front() {
                         None => {
-                            if *num_waiting == 0 {
+                            if *num_waiting == 0 || self.start.elapsed() >= PEER_REQUEST_TIMEOUT {
                                 self.state = State::Finished;
                                 return PeersIterState::Finished;
                             } else {
@@ -151,10 +156,11 @@ impl FixedPeersIter {
                         }
                         Some(p) => {
                             *num_waiting += 1;
+                            self.start = Instant::now();
                             self.last_peer = Some(p.clone());
                             match self.peers.entry(p.clone()) {
                                 Entry::Vacant(e) => {
-                                    e.insert(PeerState::Waiting);
+                                    e.insert(PeerState::Waiting { retries: 0 });
                                 }
                                 _ => {}
                             }
@@ -167,29 +173,30 @@ impl FixedPeersIter {
     }
 
     pub(crate) fn retry(&mut self) -> Option<Peer> {
-        if let Some(peer) = self.last_peer.take() {
-            self.iter.push_front(peer.clone());
-
-            match &mut self.state {
-                State::Waiting { num_waiting } => {
-                    *num_waiting -= 1;
+        if let Some(peer) = self.last_peer.clone() {
+            match self.peers.get_mut(&peer) {
+                Some(PeerState::Waiting { retries: 1 }) => {
+                    self.on_failure(&peer);
+                    return None;
                 }
-                _ => {}
-            }
+                Some(PeerState::Waiting { retries }) => {
+                    self.iter.push_front(peer.clone());
+                    *retries += 1;
+                    match &mut self.state {
+                        State::Waiting { num_waiting } => {
+                            *num_waiting -= 1;
+                        }
+                        _ => {}
+                    }
 
-            return Some(peer);
+                    return Some(peer);
+                }
+                _ => {
+                    return None;
+                }
+            };
         }
 
         return None;
-    }
-
-    pub fn into_result(self) -> impl Iterator<Item = Peer> {
-        self.peers.into_iter().filter_map(|(p, s)| {
-            if let PeerState::Succeeded = s {
-                Some(p)
-            } else {
-                None
-            }
-        })
     }
 }

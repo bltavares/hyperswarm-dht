@@ -823,11 +823,6 @@ impl RpcDht {
             stats: result.stats,
         })
     }
-
-    /// Handles a query that timed out.
-    fn query_timeout(&mut self, query: QueryStream) -> Option<RpcDhtEvent> {
-        self.query_finished(query)
-    }
 }
 
 impl Stream for RpcDht {
@@ -873,13 +868,9 @@ impl Stream for RpcDht {
                             }
                         }
                         QueryPoolState::Timeout(q) => {
-                            if let Some(event) = pin.query_timeout(q) {
-                                return Poll::Ready(Some(event));
-                            }
-                        }
-                        QueryPoolState::Retry(q) => {
                             if let Some(peer) = q.retry() {
                                 pin.holepunch(peer);
+                                break;
                             }
                         }
                         QueryPoolState::Waiting(None) | QueryPoolState::Idle => {

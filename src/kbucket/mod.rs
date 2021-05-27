@@ -108,6 +108,8 @@ pub const K_VALUE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(20) };
 /// The current value is `16`.
 pub const ALPHA_VALUE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(16) };
 
+pub(crate) const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Maximum number of k-buckets.
 const NUM_BUCKETS: usize = 256;
 

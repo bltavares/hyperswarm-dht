@@ -5,6 +5,7 @@ use fnv::FnvHashMap;
 use futures::task::Poll;
 use wasm_timer::Instant;
 
+use crate::kbucket::PEER_REQUEST_TIMEOUT;
 use crate::peers::PeersEncoding;
 use crate::rpc::IdBytes;
 use crate::{
@@ -22,8 +23,6 @@ use crate::{
 mod fixed;
 mod peers;
 pub mod table;
-
-const MAX_RETRY_ATTEMPTS: u8 = 2;
 
 /// A `QueryPool` provides an aggregate state machine for driving `Query`s to
 /// completion.
@@ -51,7 +50,7 @@ pub struct QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         QueryConfig {
-            timeout: Duration::from_secs(4),
+            timeout: PEER_REQUEST_TIMEOUT,
             replication_factor: NonZeroUsize::new(K_VALUE.get()).expect("K_VALUE > 0"),
             parallelism: ALPHA_VALUE,
         }
@@ -134,7 +133,6 @@ impl QueryPool {
     /// Polls the pool to advance the queries.
     pub fn poll(&mut self, now: Instant) -> QueryPoolState<'_> {
         let mut finished = None;
-        let mut retry = None;
         let mut timeout = None;
         let mut waiting = None;
 
@@ -153,11 +151,6 @@ impl QueryPool {
                 Poll::Pending => {
                     let elapsed = now - query.stats.start.unwrap_or(now);
                     if elapsed >= self.config.timeout {
-                        if query.retry_attempts <= MAX_RETRY_ATTEMPTS {
-                            query.retry_attempts += 1;
-                            retry = Some(query_id);
-                            break;
-                        }
                         timeout = Some(query_id);
                         break;
                     }
@@ -170,22 +163,16 @@ impl QueryPool {
             return QueryPoolState::Waiting(Some((query, event)));
         }
 
-        if let Some(query_id) = retry {
+        if let Some(query_id) = timeout {
             let query = self.queries.get_mut(&query_id).expect("s.a.");
             query.stats.start = Some(now);
-            return QueryPoolState::Retry(query);
+            return QueryPoolState::Timeout(query);
         }
 
         if let Some(query_id) = finished {
             let mut query = self.queries.remove(&query_id).expect("s.a.");
             query.stats.end = Some(now);
             return QueryPoolState::Finished(query);
-        }
-
-        if let Some(query_id) = timeout {
-            let mut query = self.queries.remove(&query_id).expect("s.a.");
-            query.stats.end = Some(now);
-            return QueryPoolState::Timeout(query);
         }
 
         if self.queries.is_empty() {
@@ -206,9 +193,7 @@ pub enum QueryPoolState<'a> {
     /// A query has finished.
     Finished(QueryStream),
     /// A query has timed out.
-    Timeout(QueryStream),
-    /// A query has to be retried
-    Retry(&'a mut QueryStream),
+    Timeout(&'a mut QueryStream),
 }
 
 #[derive(Debug)]
@@ -228,8 +213,6 @@ pub struct QueryStream {
     ty: QueryType,
     /// The value to include in each message
     value: Option<Vec<u8>>,
-    /// How many times a query has been retried
-    retry_attempts: u8,
     /// The inner query state.
     pub inner: QueryTable,
 }
@@ -260,7 +243,6 @@ impl QueryStream {
             stats: QueryStats::empty(),
             value,
             ty,
-            retry_attempts: 0,
             inner: QueryTable::new(local_id, target, peers),
         }
     }
